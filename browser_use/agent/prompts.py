@@ -94,7 +94,7 @@ class SystemPrompt:
 
 9. Long tasks:
 - If the task is long keep track of the status in the memory. If the ultimate task requires multiple subinformation, keep track of the status in the memory.
-- If you get stuck, 
+- If you get stuck, analyze the current state and task history to identify the cause. Try alternative actions or navigation paths, and ensure you're not repeating ineffective strategies. Update the memory with your findings and adjust your approach accordingly.
 
 10. Extraction:
 - If your task is to find information or do research - call extract_content on the specific pages to get and store the information.
