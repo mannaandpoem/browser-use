@@ -23,6 +23,7 @@ from langchain_core.messages import (
 from pydantic import BaseModel, ValidationError
 
 from browser_use.agent.gif import create_history_gif
+from browser_use.agent.memory.service import Memory, MemorySettings
 from browser_use.agent.message_manager.service import MessageManager, MessageManagerSettings
 from browser_use.agent.message_manager.utils import convert_input_messages, extract_json_from_model_output, save_conversation
 from browser_use.agent.prompts import AgentMessagePrompt, PlannerPrompt, SystemPrompt
@@ -146,6 +147,10 @@ class Agent(Generic[Context]):
 		injected_agent_state: Optional[AgentState] = None,
 		#
 		context: Context | None = None,
+		# Memory settings
+		enable_memory: bool = True,
+		memory_interval: int = 10,
+		memory_config: Optional[dict] = None,
 	):
 		if page_extraction_llm is None:
 			page_extraction_llm = llm
@@ -177,6 +182,9 @@ class Agent(Generic[Context]):
 			planner_llm=planner_llm,
 			planner_interval=planner_interval,
 			is_planner_reasoning=is_planner_reasoning,
+			enable_memory=enable_memory,
+			memory_interval=memory_interval,
+			memory_config=memory_config,
 		)
 
 		# Initialize state
@@ -190,10 +198,9 @@ class Agent(Generic[Context]):
 		# Model setup
 		self._set_model_names()
 		logger.info(
-			f"Starting an agent with main_model={self.model_name}, planner_model={self.planner_model_name}, "
-			f"extraction_model={self.settings.page_extraction_llm.model_name if hasattr(self.settings.page_extraction_llm, 'model_name') else None}"
+			f'🧠 Starting an agent with main_model={self.model_name}, planner_model={self.planner_model_name}, '
+			f'extraction_model={self.settings.page_extraction_llm.model_name if hasattr(self.settings.page_extraction_llm, "model_name") else None}'
 		)
-
 
 		# LLM API connection setup
 		llm_api_env_vars = REQUIRED_LLM_API_ENV_VARS.get(self.llm.__class__.__name__, [])
@@ -231,15 +238,29 @@ class Agent(Generic[Context]):
 			state=self.state.message_manager_state,
 		)
 
+		if self.settings.enable_memory:
+			memory_settings = MemorySettings(
+				agent_id=self.state.agent_id,
+				interval=self.settings.memory_interval,
+				config=self.settings.memory_config,
+			)
+
+			# Initialize memory
+			self.memory = Memory(
+				message_manager=self._message_manager,
+				llm=self.llm,
+				settings=memory_settings,
+			)
+		else:
+			self.memory = None
+
 		# Browser setup
 		self.injected_browser = browser is not None
 		self.injected_browser_context = browser_context is not None
-		if browser_context:
-			self.browser = browser
-			self.browser_context = browser_context
-		else:
-			self.browser = browser or Browser()
-			self.browser_context = BrowserContext(browser=self.browser, config=self.browser.config.new_context_config)
+		self.browser = browser or Browser()
+		self.browser_context = browser_context or BrowserContext(
+			browser=self.browser, config=self.browser.config.new_context_config
+		)
 
 		# Callbacks
 		self.register_new_step_callback = register_new_step_callback
@@ -369,6 +390,10 @@ class Agent(Generic[Context]):
 		try:
 			state = await self.browser_context.get_state()
 			active_page = await self.browser_context.get_current_page()
+
+			# generate procedural memory if needed
+			if self.settings.enable_memory and self.memory and self.state.n_steps % self.settings.memory_interval == 0:
+				self.memory.create_procedural_memory(self.state.n_steps)
 
 			await self._raise_if_stopped_or_paused()
 
@@ -514,6 +539,7 @@ class Agent(Generic[Context]):
 		include_trace = logger.isEnabledFor(logging.DEBUG)
 		error_msg = AgentError.format_error(error, include_trace=include_trace)
 		prefix = f'❌ Result failed {self.state.consecutive_failures + 1}/{self.settings.max_failures} times:\n '
+		self.state.consecutive_failures += 1
 
 		if 'Browser closed' in error_msg:
 			logger.error('❌  Browser is closed or disconnected, unable to proceed')
@@ -532,18 +558,23 @@ class Agent(Generic[Context]):
 				# give model a hint how output should look like
 				error_msg += '\n\nReturn a valid JSON object with the required fields.'
 
-			self.state.consecutive_failures += 1
 		else:
+			from anthropic import RateLimitError as AnthropicRateLimitError
 			from google.api_core.exceptions import ResourceExhausted
 			from openai import RateLimitError
 
-			if isinstance(error, RateLimitError) or isinstance(error, ResourceExhausted):
+			# Define a tuple of rate limit error types for easier maintenance
+			RATE_LIMIT_ERRORS = (
+				RateLimitError,  # OpenAI
+				ResourceExhausted,  # Google
+				AnthropicRateLimitError,  # Anthropic
+			)
+
+			if isinstance(error, RATE_LIMIT_ERRORS):
 				logger.warning(f'{prefix}{error_msg}')
 				await asyncio.sleep(self.settings.retry_delay)
-				self.state.consecutive_failures += 1
 			else:
 				logger.error(f'{prefix}{error_msg}')
-				self.state.consecutive_failures += 1
 
 		return [ActionResult(error=error_msg, include_in_memory=True)]
 
@@ -600,6 +631,7 @@ class Agent(Generic[Context]):
 			logger.debug(f'Using {self.tool_calling_method} for {self.chat_model_library}')
 			try:
 				output = self.llm.invoke(input_messages)
+				response = {'raw': output, 'parsed': None}
 			except Exception as e:
 				logger.error(f'Failed to invoke model: {str(e)}')
 				raise LLMException(401, 'LLM API call failed') from e
@@ -608,6 +640,7 @@ class Agent(Generic[Context]):
 			try:
 				parsed_json = extract_json_from_model_output(output.content)
 				parsed = self.AgentOutput(**parsed_json)
+				response['parsed'] = parsed
 			except (ValueError, ValidationError) as e:
 				logger.warning(f'Failed to parse model output: {output} {str(e)}')
 				raise ValueError('Could not parse response.')
@@ -734,7 +767,7 @@ class Agent(Generic[Context]):
 		signal_handler.register()
 
 		# Start non-blocking LLM connection verification
-		assert await self.llm._verified_api_keys, 'Failed to verify LLM API keys'
+		assert self.llm._verified_api_keys, 'Failed to verify LLM API keys'
 
 		try:
 			self._log_agent_run()
@@ -835,7 +868,20 @@ class Agent(Generic[Context]):
 		for i, action in enumerate(actions):
 			if action.get_index() is not None and i != 0:
 				new_state = await self.browser_context.get_state()
-				new_path_hashes = set(e.hash.branch_path_hash for e in new_state.selector_map.values())
+				new_selector_map = new_state.selector_map
+
+				# Detect index change after previous action
+				orig_target = cached_selector_map.get(action.get_index())  # type: ignore
+				orig_target_hash = orig_target.hash.branch_path_hash if orig_target else None
+				new_target = new_selector_map.get(action.get_index())  # type: ignore
+				new_target_hash = new_target.hash.branch_path_hash if new_target else None
+				if orig_target_hash != new_target_hash:
+					msg = f'Element index changed after action {i} / {len(actions)}, because page changed.'
+					logger.info(msg)
+					results.append(ActionResult(extracted_content=msg, include_in_memory=True))
+					break
+
+				new_path_hashes = set(e.hash.branch_path_hash for e in new_selector_map.values())
 				if check_for_new_elements and not new_path_hashes.issubset(cached_path_hashes):
 					# next action requires index but there are new elements on the page
 					msg = f'Something new appeared after action {i} / {len(actions)}'
@@ -1129,7 +1175,7 @@ class Agent(Generic[Context]):
 
 			if test_answer in response_text:
 				logger.debug(
-					f'🧠  LLM API keys {", ".join(required_keys)} verified, {llm.__class__.__name__} model is connected and responding correctly.'
+					f'🧠 LLM API keys {", ".join(required_keys)} verified, {llm.__class__.__name__} model is connected and responding correctly.'
 				)
 				llm._verified_api_keys = True
 				return True
@@ -1155,11 +1201,11 @@ class Agent(Generic[Context]):
 			return None
 
 		# Get current state to filter actions by page
-		state = await self.browser_context.get_state()
+		page = await self.browser_context.get_current_page()
 
 		# Get all standard actions (no filter) and page-specific actions
 		standard_actions = self.controller.registry.get_prompt_description()  # No page = system prompt actions
-		page_actions = self.controller.registry.get_prompt_description(state.page)  # Page-specific actions
+		page_actions = self.controller.registry.get_prompt_description(page)  # Page-specific actions
 
 		# Combine both for the planner
 		all_actions = standard_actions
