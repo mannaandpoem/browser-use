@@ -1154,12 +1154,12 @@ class Agent(Generic[Context]):
 		if not self.settings.planner_llm:
 			return None
 
-		# Get current state to filter actions by page
-		state = await self.browser_context.get_state()
+		# Get current active page to filter actions
+		active_page = await self.browser_context.get_current_page()
 
 		# Get all standard actions (no filter) and page-specific actions
 		standard_actions = self.controller.registry.get_prompt_description()  # No page = system prompt actions
-		page_actions = self.controller.registry.get_prompt_description(state.page)  # Page-specific actions
+		page_actions = self.controller.registry.get_prompt_description(active_page)  # Page-specific actions
 
 		# Combine both for the planner
 		all_actions = standard_actions
